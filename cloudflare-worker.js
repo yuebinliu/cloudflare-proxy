@@ -1,69 +1,86 @@
-// cloudflare-worker.js
+// Cloudflare Worker 代码 - 多域名反向代理
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
+    // 域名到目标服务器的映射
     const domainMappings = {
       'test.thanx.top': 'http://106.15.4.153:8085',
       'api.thanx.top': 'http://106.15.4.153:8086',
-      'admin.thanx.top': 'http://106.15.4.153:8087'
+      'admin.thanx.top': 'http://106.15.4.153:8087',
+      'reverse-proxy.yuebinliu.workers.dev': 'http://106.15.4.153:8085' // 测试用
     };
 
     const url = new URL(request.url);
     const target = domainMappings[url.hostname];
     
+    // 如果域名未配置，返回404
     if (!target) {
-      return new Response('Domain not configured', { status: 404 });
-    }
-
-    // 修改请求头
-    const newHeaders = new Headers(request.headers);
-    newHeaders.set('X-Forwarded-Host', url.hostname);
-    newHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-    newHeaders.delete('host');
-
-    // 转发请求
-    const targetUrl = new URL(url.pathname + url.search, target);
-    let response = await fetch(targetUrl.toString(), {
-      method: request.method,
-      headers: newHeaders,
-      body: request.body,
-      redirect: 'manual' // 手动处理重定向
-    });
-
-    // 处理重定向
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get('location');
-      if (location && location.includes(target)) {
-        const newLocation = location.replace(target, `https://${url.hostname}`);
-        response = new Response(response.body, response);
-        response.headers.set('location', newLocation);
-        return response;
-      }
-    }
-
-    // 处理HTML内容，替换链接
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType.includes('text/html')) {
-      let html = await response.text();
-      
-      // 替换所有原始URL为代理域名
-      html = html.replace(
-        new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
-        `https://${url.hostname}`
-      );
-      
-      // 替换相对协议URL
-      html = html.replace(
-        /(src|href)="\/\//g,
-        `$1="https://`
-      );
-
-      // 返回修改后的响应
-      return new Response(html, {
-        status: response.status,
-        headers: response.headers
+      return new Response('域名未配置: ' + url.hostname + '\n\n已配置的域名: ' + Object.keys(domainMappings).join(', '), { 
+        status: 404,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
       });
     }
 
-    return response;
+    // 准备转发请求
+    const targetUrl = new URL(url.pathname + url.search, target);
+    const newHeaders = new Headers(request.headers);
+    
+    // 设置代理头
+    newHeaders.set('X-Forwarded-Host', url.hostname);
+    newHeaders.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
+    newHeaders.set('X-Real-IP', request.headers.get('cf-connecting-ip') || 'unknown');
+    newHeaders.delete('host'); // 删除原始host头
+
+    try {
+      // 转发请求到目标服务器
+      let response = await fetch(targetUrl.toString(), {
+        method: request.method,
+        headers: newHeaders,
+        body: request.body,
+        redirect: 'manual' // 手动处理重定向
+      });
+
+      // 处理重定向响应
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get('location');
+        if (location && location.includes('106.15.4.153')) {
+          // 替换重定向地址中的原始IP为代理域名
+          const newLocation = location.replace(
+            /http:\/\/106\.15\.4\.153:\d+/g, 
+            `https://${url.hostname}`
+          );
+          const newResponse = new Response(response.body, response);
+          newResponse.headers.set('location', newLocation);
+          return newResponse;
+        }
+      }
+
+      // 处理HTML内容，替换其中的链接
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        let html = await response.text();
+        
+        // 替换所有原始服务器链接为代理域名
+        html = html.replace(
+          /http:\/\/106\.15\.4\.153:\d+/g,
+          `https://${url.hostname}`
+        );
+        
+        // 返回修改后的HTML
+        return new Response(html, {
+          status: response.status,
+          headers: response.headers
+        });
+      }
+
+      // 对于非HTML内容，直接返回
+      return response;
+      
+    } catch (error) {
+      // 错误处理
+      return new Response(`代理错误: ${error.message}\n\n目标URL: ${targetUrl.toString()}`, { 
+        status: 502,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
   }
-};
+}
